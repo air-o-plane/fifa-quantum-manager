@@ -1,0 +1,20 @@
+# Core data + optimisation
+pandas
+openpyxl
+requests
+pulp
+pyomo
+
+# Streaming (Confluent Cloud / Kafka)
+confluent-kafka
+
+# Quantum branch (optional — needs Python >=3.10,<3.13)
+# The QAOA encoding verification runs offline; circuit synthesis/execution
+# require a Classiq account with synthesis entitlement (not on the free tier).
+classiq
+
+# Notes:
+# - Python 3.12 is required for `classiq` (it does not support 3.13+).
+#   A venv on 3.12 is the simplest setup; see the README.
+# - If you only want the classical pipeline, you can skip `classiq` and run
+#   on any Python >=3.10.

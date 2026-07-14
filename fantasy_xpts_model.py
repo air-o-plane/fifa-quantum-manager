@@ -42,6 +42,7 @@ USAGE
 
 from __future__ import annotations
 import sys
+import os
 import csv
 import glob
 import statistics as st
@@ -51,7 +52,13 @@ import pandas as pd
 from fantasy_name_bridge import load_pool, _read_csv
 
 K_SHRINK_FORM   = 2.0    # form-weight half-saturation (rounds)
-K_SHRINK_PLAYER = 1.5    # per-player regression-to-mean strength (pseudo-rounds)
+K_SHRINK_PLAYER = 1.5    # baseline per-player regression-to-mean strength
+# Backtest after RND2 (corr +0.282, MAE 2.58) showed the model over-punishes
+# players with a single low-scoring observation — many under-forecasts
+# (Gakpo, Ueda, Brobbey...) were 1-game blankers who exploded next round.
+# So for nobs=1, shrink HARDER toward the positional mean; ease off with more
+# games, where the player's own form is genuinely informative.
+K_SHRINK_BY_NOBS = {1: 2.5, 2: 1.5, 3: 1.0}      # cap drops as games accumulate
 NO_PLAY_HAIRCUT = 0.85   # multiplier on prior for players with no recent minutes
 
 
@@ -127,32 +134,62 @@ def build_xpts():
             ppd[posn] = 0.5      # fallback if a position had no scorers
             pos_mean[posn] = 2.0
 
+    # OPTION 2 — stream-derived points as fallback for players with no
+    # hand-curated rnd<N>_points.csv row. Activates automatically when
+    # stream_points.csv is present (written by fantasy_stream_consumer.py).
+    # These players currently fall all the way back to the prior; stream data
+    # gives them a real, validated form signal instead.
+    # The stream's per-match average uses the same nobs-dependent shrinkage as
+    # hand-curated form, since it's similarly noisy (MAE ~0.55 per round).
+    stream_fallback: dict[int, tuple[float, int]] = {}   # pool_row -> (avg, nmatches)
+    stream_csv = "stream_points.csv"
+    if os.path.exists(stream_csv):
+        try:
+            sdf = _read_csv(stream_csv)
+            for _, r in sdf.iterrows():
+                pr = int(r["pool_row"])
+                matches = int(r.get("matches", 1) or 1)
+                avg = float(r.get("stream_points", 0) or 0) / matches
+                stream_fallback[pr] = (avg, matches)
+        except Exception as e:
+            print(f"  (stream fallback skipped: {e})")
+
     w_form = n_rounds / (n_rounds + K_SHRINK_FORM)   # global form weight
     fixture_table = load_fixture_mult()
 
     # Per-player recent form: mean of their available round points, regressed
-    # toward the positional mean (shrinkage by K_SHRINK_PLAYER pseudo-rounds).
+    # toward the positional mean (shrinkage tuned by # observations).
     def player_form(row: int, posn: str):
         vals = [rounds[r][row] for r in rounds if row in rounds[r]]
-        if not vals:
-            return None, 0
-        m = st.mean(vals)
-        nobs = len(vals)
-        shrunk = ((nobs * m + K_SHRINK_PLAYER * pos_mean[posn])
-                  / (nobs + K_SHRINK_PLAYER))
-        return shrunk, nobs
+        if vals:
+            m = st.mean(vals)
+            nobs = len(vals)
+            k = K_SHRINK_BY_NOBS.get(nobs, 0.75)
+            return (nobs * m + k * pos_mean[posn]) / (nobs + k), nobs, "curated"
+        # No hand-curated data — try stream-derived fallback
+        if row in stream_fallback:
+            avg, nm = stream_fallback[row]
+            k = K_SHRINK_BY_NOBS.get(nm, 0.75)
+            shrunk = (nm * avg + k * pos_mean[posn]) / (nm + k)
+            return shrunk, nm, "stream"
+        return None, 0, "none"
 
     out = []
+    n_stream_used = 0
     for p in pool:
         prior = ppd[p.position] * p.price
-        form, nobs = player_form(p.row, p.position)
+        form, nobs, source = player_form(p.row, p.position)
         if form is None:
-            # no recent minutes -> lean on prior with a mild haircut
+            # no curated OR stream data -> lean on prior with a mild haircut
             xpts = prior * NO_PLAY_HAIRCUT
             basis = "prior(no-form)"
         else:
             xpts = w_form * form + (1 - w_form) * prior
-            basis = f"form({nobs})+prior"
+            if source == "stream":
+                basis = f"stream({nobs})+prior"
+                n_stream_used += 1
+            else:
+                basis = f"form({nobs})+prior"
         xpts *= fixture_multiplier(p.nation_code, p.position, fixture_table)
         out.append({"pool_row": p.row, "player_name": p.display,
                     "nation_code": p.nation_code, "position": p.position,
@@ -176,7 +213,11 @@ def build_xpts():
         print(f"  {r['player_name']:<24}{r['nation_code']:<5}{r['position']:<5}"
               f"{r['price']:>6}{r['xpts']:>7}  {r['basis']}")
     nf = sum(1 for r in out if r["basis"].startswith("prior"))
-    print(f"\n{len(out)-nf} players have form signal; {nf} fall back to the prior.")
+    nc = sum(1 for r in out if r["basis"].startswith("form"))
+    ns = n_stream_used
+    print(f"\n{nc} players have curated form signal; "
+          f"{ns} use stream-derived fallback; "
+          f"{nf} fall back to the prior.")
 
 
 if __name__ == "__main__":

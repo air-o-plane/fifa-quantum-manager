@@ -54,6 +54,7 @@ import requests
 from fantasy_data_feed import (
     PlayerStatsEvent, PlayerAvailabilityEvent, Availability,
     StatsSource, AvailabilitySource, KafkaPublisher, run_feed,
+    TOPIC_AVAILABILITY,
 )
 
 BASE_URL = "https://v3.football.api-sports.io"
@@ -220,12 +221,16 @@ class ApiFootballAvailabilitySource(AvailabilitySource):
         for item in data.get("response", []):
             player = item.get("player") or {}
             team   = item.get("team") or {}
-            # Per the docs the two key fields are `type` ("Injury"/"Suspension")
-            # and `reason`; parse their location defensively.
+            # API actually returns type='Missing Fixture' for most records, with
+            # the real cause in `reason` (e.g. 'Calf Injury', 'Suspended 1 match').
+            # Classify on whichever field gives a signal; reason is the reliable one.
             itype  = (player.get("type") or item.get("type") or "").lower()
-            reason = player.get("reason") or item.get("reason")
-            status = (Availability.SUSPENDED if "susp" in itype
-                      else Availability.INJURED if itype
+            reason = player.get("reason") or item.get("reason") or ""
+            sig = f"{itype} {reason}".lower()
+            status = (Availability.SUSPENDED if "susp" in sig
+                      else Availability.INJURED if any(k in sig for k in
+                          ("injur", "strain", "knock", "fracture", "sprain",
+                           "tear", "illness", "concussion", "missing fixture"))
                       else Availability.UNKNOWN)
             yield PlayerAvailabilityEvent(
                 player_name=player.get("name", "UNKNOWN"),
@@ -307,6 +312,109 @@ def probe2(league_id: int):
     print(f"\n[daily requests remaining: {client.daily_remaining}]")
 
 
+def probe_injuries(league_id: int):
+    """Diagnostic — call /injuries directly and show what API-Football returns
+    for this league/season. The /leagues coverage.injuries flag must be true
+    for data to exist (API-Football policy). Updates ~every 4 hours.
+
+    Use BEFORE running 'injuries' to confirm there is data to publish.
+    """
+    client = ApiFootballClient()
+    # 1) coverage check
+    print(f"== /leagues coverage for league {league_id}, season {SEASON} ==")
+    lg = client.get("leagues", id=league_id, season=SEASON)
+    cov = None
+    for blk in lg.get("response", []):
+        for s in blk.get("seasons", []):
+            if s.get("year") == SEASON:
+                cov = (s.get("coverage") or {})
+                break
+    if cov is None:
+        print("  could not locate coverage block for this season.")
+    else:
+        inj = cov.get("injuries")
+        print(f"  coverage.injuries = {inj!r}  "
+              f"({'OK' if inj else 'API does not track injuries for this league'})")
+
+    # 2) injuries call
+    print(f"\n== /injuries for league {league_id}, season {SEASON} ==")
+    data = client.get("injuries", league=league_id, season=SEASON)
+    resp = data.get("response", [])
+    print(f"  records returned: {len(resp)}")
+    if resp:
+        print("\nFirst record raw JSON (shape we'll parse):")
+        print(json.dumps(resp[0], indent=2, ensure_ascii=False)[:1500])
+        # quick summary
+        types = {}
+        for r in resp:
+            p = r.get("player") or {}
+            t = (p.get("type") or r.get("type") or "unknown")
+            types[t] = types.get(t, 0) + 1
+        print(f"\nType breakdown: {types}")
+    print(f"\n[daily requests remaining: {client.daily_remaining}]")
+
+
+def injuries(league_id: int):
+    """Fetch injuries/suspensions and publish to wc26.player.availability.
+    Dry-run unless KAFKA_* env vars are set (same behaviour as feed).
+    Writes a local CSV (availability_snapshot.csv) regardless, so the
+    transfer recommender can read it without needing the stream consumer.
+
+    The API returns one record per upcoming missed fixture, so the SAME player
+    appears multiple times (e.g. Neymar 3x = will miss 3 upcoming fixtures).
+    We dedupe to one row per (nation, player) for the snapshot CSV so the
+    recommender doesn't list them multiple times. Each event is still published
+    to Kafka individually (the stream is allowed to carry per-fixture detail).
+    """
+    import csv
+    client = ApiFootballClient()
+    src = ApiFootballAvailabilitySource(client, league_id)
+    pub = KafkaPublisher()
+    mode_msg = ("LIVE (Confluent Cloud)" if not pub.dry_run else
+                "DRY-RUN (KAFKA_* env vars not set — messages will NOT reach Confluent)")
+    print(f"Publisher mode: {mode_msg}\n")
+    events = list(src.fetch())
+    seen: dict[tuple, dict] = {}
+    for ev in events:
+        # publish each per-fixture event to Kafka (downstream may want the detail)
+        pub.publish(TOPIC_AVAILABILITY, ev.key(), ev.to_json())
+        # dedupe per (nation, player) for the CSV snapshot
+        key = (ev.nation, ev.player_name)
+        if key not in seen:
+            seen[key] = {
+                "player_name": ev.player_name,
+                "nation": ev.nation,
+                "status": ev.status.value if hasattr(ev.status, "value") else str(ev.status),
+                "detail": ev.detail or "",
+                "fetched_at": ev.fetched_at,
+                "n_fixtures_affected": 1,
+            }
+        else:
+            seen[key]["n_fixtures_affected"] += 1
+
+    # CRITICAL: flush the producer so buffered messages actually reach Confluent
+    # before the process exits. Without this, "publish" calls are merely queued.
+    summary = pub.flush()
+
+    rows = list(seen.values())
+    with open("availability_snapshot.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["player_name", "nation", "status",
+                                          "detail", "fetched_at",
+                                          "n_fixtures_affected"])
+        w.writeheader(); w.writerows(rows)
+
+    print(f"\nFetched {len(events)} availability records.")
+    print(f"Publisher summary: {summary}")
+    print(f"Deduped to {len(rows)} unique players -> availability_snapshot.csv.")
+    if rows:
+        print("\nUnique unavailable players:")
+        for r in rows:
+            tag = f" (misses {r['n_fixtures_affected']} fixtures)" if r['n_fixtures_affected'] > 1 else ""
+            print(f"  {r['nation']:<20} {r['player_name']:<24} "
+                  f"{r['status']:<10} {r['detail']}{tag}")
+    print(f"\n[daily requests remaining: {client.daily_remaining}]")
+
+
 def feed(league_id: int):
     client = ApiFootballClient()
     pub = KafkaPublisher()   # dry-run unless KAFKA_* env vars are set
@@ -343,6 +451,10 @@ def main():
         probe2(int(sys.argv[2]))
     elif mode == "probe3" and len(sys.argv) > 2:
         probe3(int(sys.argv[2]))
+    elif mode == "probe_injuries" and len(sys.argv) > 2:
+        probe_injuries(int(sys.argv[2]))
+    elif mode == "injuries" and len(sys.argv) > 2:
+        injuries(int(sys.argv[2]))
     elif mode == "feed" and len(sys.argv) > 2:
         feed(int(sys.argv[2]))
     else:

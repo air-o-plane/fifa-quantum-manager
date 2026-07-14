@@ -2,7 +2,7 @@ r"""
 Cross-validate stream-derived points against the hand-entered FIFA points.
 
 Joins stream_points.csv (from the Kafka consumer, FIFA rules applied to the
-streamed box scores) against rnd1_points.csv (the hand-entered actual
+streamed box scores) against rnd1_points.csv (Oliver's hand-entered actual
 FIFA fantasy points) on pool_row, and reports agreement.
 
 If the two AGREE for players in both, the producer->Kafka->consumer->scoring

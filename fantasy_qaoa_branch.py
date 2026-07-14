@@ -51,8 +51,26 @@ XPTS_CSV     = "xpts.csv"     # real objective; falls back to price if absent
 SQUAD_QUOTA  = {"GK": 2, "DEF": 5, "MID": 5, "FWD": 3}
 # Shortlist size per position. 19 players => 19 qubits (quotas only), small
 # enough to FULLY enumerate and verify. Raise for a harder instance.
-SHORTLIST    = {"GK": 3, "DEF": 6, "MID": 6, "FWD": 4}
-PENALTY      = 100.0          # constraint penalty energy (verified sufficient below)
+SHORTLIST    = {"GK": 3, "DEF": 6, "MID": 6, "FWD": 3}   # 18 players total
+# FWD reduced from 4 to 3 to attempt to bring the quotas+budget instance within
+# the Classiq simulator's 28-qubit ceiling. The quotas+budget instance previously
+# required 29 qubits (1 over the limit). Removing one forward removes one binary
+# variable x_i from the Pyomo model, which should reduce the qubit count —
+# though I am not certain by exactly how much, since the budget constraint's
+# slack variables may or may not change. Run WITHOUT --cloud or --sweep first to
+# check the reported qubit count before committing to any cloud run.
+PENALTY      = 10.0           # constraint penalty energy.
+# Calibration grounded in pprint() analysis of the actual Pyomo model:
+#   Objective coefficients : 5.70 – 8.88  (xPts values, floating point)
+#   Budget constraint coeff: 39 – 105     (prices ×10, integer)
+#   Budget RHS             : 1089
+# Classiq community guidance (2026-07-07): penalty should be in the range
+# of the objective function values (~5–9). Penalties of 100 or 500
+# overwhelm the objective landscape and make QAOA rotation angles too
+# small to converge. Standard heuristic: penalty > max single objective
+# coefficient (8.88), so 10 is the calibrated starting point.
+# Tuning guide: if budget instance still infeasible → try 5 (halve) or 20.
+#               if quotas-only degrades → penalty is too small, try 12–15.
 RUN_ON_CLASSIQ_CLOUD = False  # set True locally after `classiq.authenticate()`
 SINGLE_RUN_FIRST     = True   # True: one proving run; False: full depth sweep
 EXPORT_QMOD          = False  # True: write .qmod files for the web IDE (no synthesis)
@@ -182,69 +200,56 @@ def verify_encoding(short):
 # Classiq cloud QAOA  (gated — needs authenticate(); see experiment_sweep)
 # ----------------------------------------------------------------------
 def run_on_classiq(short, budget_m, num_layers):
-    """One QAOA run on Classiq cloud using the CURRENT CombinatorialProblem API
+    """One QAOA run on Classiq cloud using the CombinatorialProblem API
     (classiq 1.17.0). Assumes classiq.authenticate() was already called this
-    session. Returns the raw result object from .optimize() for parsing."""
+    session. Returns (combi, samples_df) where samples_df is the DataFrame
+    from combi.sample() with columns: solution, probability, cost."""
     from classiq.applications.combinatorial_optimization import CombinatorialProblem
-    from classiq.execution import ExecutionPreferences, ClassiqBackendPreferences
 
     m = pyomo_model(short, budget_m)
     combi = CombinatorialProblem(pyo_model=m, num_layers=num_layers,
                                  penalty_factor=int(PENALTY))
     combi.get_model()                       # synthesize the QAOA ansatz (cloud)
 
-    # Pin execution to the SIMULATOR backend (free-tier friendly; no hardware).
-    exec_prefs = ExecutionPreferences(
-        backend_preferences=ClassiqBackendPreferences(backend_name="simulator"))
-    # optimize() runs the hybrid classical-quantum loop (cloud) and returns the
-    # optimized result. maxiter/quantile keep it light for the free tier.
-    result = combi.optimize(exec_prefs, maxiter=60, quantile=0.7)
-    return combi, result
+    # optimize() runs the variational loop and returns the optimised parameters.
+    # Per the current docs the signature is: combi.optimize(maxiter, quantile)
+    # with no exec_prefs argument; backend defaults to simulator.
+    # maxiter progression (all at penalty=10, calibrated to obj fn scale):
+    #   60  → budget depth-1: all negative (insufficient iterations)
+    #   150 → budget depth-1: +0.381 (first positive result); depth-2: ERR
+    #          (Classiq platform overload); depth-3: -1.014
+    #   300 → current attempt: hoping to push depth-1 higher and get
+    #          consistent positive results across depths
+    # If 300 still insufficient, next step is 500 or exploring Grover mixer QAOA.
+    optimized_params = combi.optimize(maxiter=300, quantile=0.7)
+
+    # sample() evaluates the circuit at the optimised parameters and returns a
+    # DataFrame with columns: solution (dict), probability (float), cost (float).
+    # cost is always a minimisation value, so maximisation problems use -cost.
+    samples_df = combi.sample(optimized_params)
+    return combi, samples_df
 
 
-def best_value_from_result(short, combi, result):
-    """Best (max-points) objective among the QAOA solutions.
-
-    The CombinatorialProblem result shape can vary by version, so this is
-    defensive: it tries the common forms and, if none match, raises with the
-    raw structure so you can see exactly what to key on. We MINIMISE -points,
-    so a solution's pyomo objective is -value; best value = -min(objective)
-    over feasible solutions, OR we recompute value directly from the chosen
-    players when a bitstring/selection is available (more robust)."""
-    # Preferred: result exposes a solutions table (DataFrame or list of dicts)
-    # with a 'solution'/'x' selection and a 'cost'/'objective' column.
-    rows = None
-    for attr in ("solutions", "result", "optimized_result"):
-        cand = getattr(result, attr, None)
-        if cand is not None:
-            rows = cand
-            break
-    if rows is None and isinstance(result, (list, tuple)):
-        rows = result
-
-    # If we got a DataFrame, turn into records
-    if isinstance(rows, pd.DataFrame):
-        rows = rows.to_dict("records")
-
-    best_val = None
-    if isinstance(rows, (list, tuple)) and rows:
-        for r in rows:
-            cost = None
-            if isinstance(r, dict):
-                cost = r.get("cost", r.get("objective", r.get("value")))
-            else:
-                cost = (getattr(r, "cost", None) or getattr(r, "objective", None))
-            if cost is not None:
-                v = -float(cost)            # we minimise -points
-                best_val = v if best_val is None else max(best_val, v)
-    if best_val is not None:
-        return best_val
-
-    raise ValueError(
-        "Could not parse Classiq result. Inspect and adjust best_value_from_result.\n"
-        f"  type(result)={type(result)}\n"
-        f"  dir(result)={[a for a in dir(result) if not a.startswith('_')][:25]}\n"
-        f"  repr={repr(result)[:400]}")
+def best_value_from_result(short, combi, samples_df):
+    """Extract the best objective value from the samples DataFrame returned by
+    combi.sample(). Per the current Classiq docs, samples_df has three columns:
+      solution    : dict of variable assignments, e.g. {'x': [0, 1, 0, ...]}
+      probability : float
+      cost        : float (minimisation convention, so our -xPts values)
+    The best xPts value is -cost.min() (negate because we minimised -xPts).
+    Raises with the raw DataFrame info if the expected columns are absent."""
+    if not isinstance(samples_df, pd.DataFrame):
+        raise ValueError(
+            f"Expected a DataFrame from combi.sample() but got "
+            f"{type(samples_df)}. Raw repr: {repr(samples_df)[:400]}")
+    if "cost" not in samples_df.columns:
+        raise ValueError(
+            f"samples_df has no 'cost' column. Columns present: "
+            f"{list(samples_df.columns)}\n"
+            f"First row: {samples_df.iloc[0].to_dict() if len(samples_df) else 'empty'}")
+    best_cost = samples_df["cost"].min()        # most negative = best xPts
+    best_value = -float(best_cost)              # negate: we minimised -xPts
+    return best_value
 
 
 def export_qmod(short, budget_m, num_layers=1):
@@ -281,14 +286,19 @@ def export_qmod(short, budget_m, num_layers=1):
     print("In the IDE you can set QAOA layers and view the approximation ratio "
           "against the ILP optimum below.")
     return written
-    """Control-first QAOA experiment. Runs the VERIFIED quotas-only instance
-    across QAOA depths, then the harder quotas+budget instance, and reports
-    the approximation ratio (QAOA best / ILP optimum) for each. The ratio
-    sitting below 1.0 and rising with depth is the expected, healthy shape."""
-    import classiq
-    classiq.authenticate()                     # once per session (cached after)
 
-    if SINGLE_RUN_FIRST:
+
+def experiment_sweep(short, budget_m, layers=LAYER_SWEEP, single_run=None):
+    """Control-first QAOA experiment. Runs the verified quotas-only instance
+    across QAOA depths, then the harder quotas+budget instance, reporting
+    the approximation ratio (QAOA best / ILP optimum) for each depth.
+    single_run: True = one proving run only; False = full sweep;
+    None = fall back to the module-level SINGLE_RUN_FIRST constant."""
+    do_single = SINGLE_RUN_FIRST if single_run is None else single_run
+    import classiq
+    classiq.authenticate(overwrite=True)       # force fresh token each run
+
+    if do_single:
         # ONE proving run: verified quotas-only instance, depth 1. Confirms the
         # whole cloud path works and the result parses before spending more.
         print("SINGLE_RUN_FIRST: one proving run (quotas-only, depth 1)...")
@@ -326,17 +336,29 @@ def export_qmod(short, budget_m, num_layers=1):
 
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="FIFA WC2026 Fantasy QAOA branch")
+    parser.add_argument("--cloud", action="store_true",
+        help="Proving run: one QAOA circuit (quotas-only, depth 1) on Classiq cloud.")
+    parser.add_argument("--sweep", action="store_true",
+        help="Full depth sweep (depths 1,2,3 x 2 instances). Implies --cloud.")
+    parser.add_argument("--export-qmod", action="store_true",
+        help="Write .qmod files for the Classiq web IDE (no synthesis call).")
+    args = parser.parse_args()
+
+    run_cloud  = args.cloud or args.sweep or RUN_ON_CLASSIQ_CLOUD
+    full_sweep = args.sweep or (not SINGLE_RUN_FIRST)
+    export     = args.export_qmod or EXPORT_QMOD
+
     short = build_shortlist(INPUT_XLSX)
     print(f"Shortlist: {len(short)} players "
           f"({', '.join(f'{p}:{SHORTLIST[p]}' for p in SHORTLIST)})\n")
 
-    # Binding-but-feasible budget for the shortlist (midpoint of achievable range)
     lo, hi = squad_cost_range(short)
     budget_m = round((lo + hi) / 2, 1)
     print(f"Shortlist squad cost range: ${lo:.1f}M – ${hi:.1f}M  "
           f"-> demo budget ${budget_m:.1f}M\n")
 
-    # Qubit cost of each constraint set (the scaling lesson)
     for label, bud in [("quotas only", None), ("quotas + budget", budget_m)]:
         h = pyo_model_to_hamiltonian(pyomo_model(short, bud), penalty_energy=PENALTY)
         print(f"  {label:<16}: {len(h[0].pauli):>2} qubits, {len(h):>3} Pauli terms")
@@ -355,19 +377,20 @@ if __name__ == "__main__":
     for _, r in short.loc[list(opt_set)].sort_values('Position').iterrows():
         print(f"    {r['Position']:<3} {r['Player Name']:<20} {r['Nation']:<4} ${r['Price ($M)']:.1f}M")
 
-    if EXPORT_QMOD:
-        print("\nExporting .qmod model files for the Classiq web IDE "
-              "(no synthesis call)...")
-        # also print both ILP optima so you can compute the approx ratio in the IDE
+    if export:
+        print("\nExporting .qmod model files for the Classiq web IDE...")
         _, ilp_quotas = classical_optimum(short, budget_m=None)
         _, ilp_budget = classical_optimum(short, budget_m=budget_m)
         export_qmod(short, budget_m, num_layers=1)
-        print(f"\n  ILP optima to benchmark the IDE's QAOA result against:")
+        print(f"\n  ILP optima to benchmark against:")
         print(f"    quotas-only   : {ilp_quotas:.1f}")
         print(f"    quotas+budget : {ilp_budget:.1f}")
-    elif RUN_ON_CLASSIQ_CLOUD:
-        print("\nRunning QAOA on Classiq cloud (control instance first)...")
-        experiment_sweep(short, budget_m)
+    elif run_cloud:
+        mode = "full depth sweep" if full_sweep else "proving run (depth 1)"
+        print(f"\nRunning QAOA on Classiq cloud — {mode}...")
+        experiment_sweep(short, budget_m, single_run=not full_sweep)
     else:
-        print("\n[Classiq cloud run disabled — set RUN_ON_CLASSIQ_CLOUD=True for the "
-              "depth sweep, or EXPORT_QMOD=True to write .qmod files for the web IDE.]")
+        print("\n[Classiq cloud run disabled]")
+        print("  --cloud   : proving run (one circuit, depth 1) — run this first")
+        print("  --sweep   : full depth sweep (after proving run succeeds)")
+        print("  --export-qmod : write .qmod files for the web IDE")

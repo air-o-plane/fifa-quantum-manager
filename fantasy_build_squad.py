@@ -27,11 +27,38 @@ def main(budget: float = 100.0, nation_cap: int = 3):
     pool = ilp.load_pool(POOL_XLSX)           # adds 'pid' = 0-based row index
     xp = _read_csv(XPTS_CSV)[["pool_row", "xpts"]]
 
+    # KNOCKOUT FILTER: if r32_nations.csv (or any qualified_nations.csv) is
+    # present, restrict the pool to those nations only. This stops the model
+    # picking players from eliminated teams (Iran, Qatar, etc.) just because
+    # they had strong group-stage form. Without this file, behaviour is
+    # unchanged from the group-stage default.
+    # The file's column is `nation` and values are FULL NAMES matching the
+    # pool's `Nation` column (e.g. "United States", not "USA").
+    import os
+    nation_filter = None
+    for path in ("qualified_nations.csv", "r32_nations.csv"):
+        if os.path.exists(path):
+            nation_filter = path; break
+    if nation_filter:
+        qual_df = _read_csv(nation_filter)
+        col = "nation" if "nation" in qual_df.columns else qual_df.columns[0]
+        qual = qual_df[col].astype(str).str.strip().tolist()
+        before = len(pool)
+        pool = pool[pool["Nation"].isin(qual)].reset_index(drop=True)
+        # NOTE: do NOT reassign pid here — xpts.csv joins on the original
+        # pool_row, and the ILP uses pid as dict keys (not array indices),
+        # so non-contiguous pids work fine.
+        unmatched = set(qual) - set(pool["Nation"].unique())
+        if unmatched:
+            print(f"WARNING: these nations in {nation_filter} had no players "
+                  f"in the pool (spelling mismatch?): {sorted(unmatched)}")
+        print(f"Knockout filter from {nation_filter}: "
+              f"{len(qual)} qualified nations, pool reduced from {before} "
+              f"to {len(pool)} eligible players, {pool['Nation'].nunique()} nations.")
+
     merged = pool.merge(xp, left_on="pid", right_on="pool_row", how="left")
     missing = merged["xpts"].isna().sum()
     if missing:
-        # Players the model didn't score (shouldn't happen — model covers all) :
-        # default to 0 so they're simply never selected.
         merged["xpts"] = merged["xpts"].fillna(0.0)
         print(f"Note: {missing} players had no xPts; set to 0.")
     merged["xPts"] = merged["xpts"]           # the column name the ILP expects

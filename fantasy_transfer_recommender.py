@@ -90,9 +90,124 @@ def recommend(free_transfers=2, budget=100.0, nation_cap=3):
 
     print(f"Current squad: ${cur_value:.1f}M used, ${bank:.1f}M in bank, "
           f"sum xPts {cur_xpts:.2f} (all 15).")
-    print(f"Free transfers: {free_transfers}; extra cost {HIT_COST:.0f} pts each.\n")
+    print(f"Free transfers: {free_transfers}; extra cost {HIT_COST:.0f} pts each.")
+
+    # ---- AVAILABILITY FLAGS: surface injured/suspended squad members ----
+    # Reads availability_snapshot.csv if present (produced by
+    # fantasy_apifootball_adapter.py injuries <league>). These are FORCED-OUT
+    # candidates that the model cannot see — they'll score 0 every round
+    # they're out, so transferring them is high-value regardless of xPts gain.
+    try:
+        from fantasy_name_bridge import nation_lookup, match_team, norm as _norm
+        avail = _read_csv("availability_snapshot.csv")
+        team_lut = nation_lookup(pool)
+        squad_by_key = {(p.nation_code, _norm(p.display)): p for p in squad}
+        # also key on last name as a fallback
+        for p in squad:
+            squad_by_key.setdefault((p.nation_code, _norm(p.last)), p)
+        forced_out = []
+        for _, r in avail.iterrows():
+            code = match_team(str(r.get("nation", "")), team_lut)
+            if not code:
+                continue
+            key = (code, _norm(str(r.get("player_name", ""))))
+            p = squad_by_key.get(key)
+            if p is None:
+                # try last-name match
+                last_key = (code, _norm(str(r.get("player_name", "")).split()[-1])
+                            if str(r.get("player_name", "")).strip() else (code, ""))
+                p = squad_by_key.get(last_key)
+            if p is not None:
+                forced_out.append((p, str(r.get("status", "")),
+                                   str(r.get("detail", ""))))
+        if forced_out:
+            print("\n⚠ FORCED OUT — your squad has unavailable players (injury/suspension):")
+            for p, status, detail in forced_out:
+                print(f"   {p.position} {p.display} ({p.nation_code})  "
+                      f"{status} — {detail or '(no detail)'}")
+            print("  These will score 0 while unavailable. Transferring them out "
+                  "is high-value regardless of xPts gain.")
+    except FileNotFoundError:
+        pass        # no availability data yet; silent skip
+    except Exception as e:
+        print(f"  (availability check skipped: {e})")
+
+    # ---- ELIMINATION FLAGS: surface squad members from knocked-out nations ----
+    # Reads qualified_nations.csv (or r32_nations.csv). Any squad player from a
+    # nation NOT in that file will score 0 every remaining round — they must be
+    # transferred out regardless of xPts ranking. The injury feed cannot catch
+    # this (it tracks player-level unavailability, not team elimination).
+    try:
+        import os
+        _qf_path = None
+        for _p in ("qualified_nations.csv", "r32_nations.csv"):
+            if os.path.exists(_p):
+                _qf_path = _p; break
+        if _qf_path:
+            from fantasy_name_bridge import nation_lookup, match_team
+            _qdf = _read_csv(_qf_path)
+            _qcol = "nation" if "nation" in _qdf.columns else _qdf.columns[0]
+            _qual_names = set(_qdf[_qcol].astype(str).str.strip())
+            # map full names → codes using pool
+            _team_lut = nation_lookup(pool)
+            _qual_codes: set[str] = set()
+            for _nm in _qual_names:
+                _code = match_team(_nm, _team_lut)
+                if _code:
+                    _qual_codes.add(_code)
+                else:
+                    _qual_codes.add(_nm)   # keep as-is if bridge misses
+            _eliminated = [p for p in squad if p.nation_code not in _qual_codes]
+            if _eliminated:
+                print("\n⚠ ELIMINATED — your squad contains players from knocked-out nations"
+                      " (they will score 0 every remaining round):")
+                for p in _eliminated:
+                    print(f"   {p.position} {p.display} ({p.nation_code})  "
+                          f"— nation eliminated, MUST transfer out")
+                print(f"  {len(_eliminated)} forced transfer(s) needed before optional upgrades.")
+    except Exception as e:
+        print(f"  (elimination check skipped: {e})")
+    print()
 
     # All candidate single transfers: out (in squad) -> in (same position, not in squad,
+    # KNOCKOUT FILTER: restrict candidate "IN" players to qualified nations only.
+    # Mirrors the filter in fantasy_build_squad.py. Without this, the recommender
+    # suggests players from eliminated nations (Iran, Curaçao, Uruguay etc.) who
+    # will score 0 every remaining round. Activates when qualified_nations.csv or
+    # r32_nations.csv is present; silent no-op in group stage when neither exists.
+    import os
+    qualified_nations: set[str] | None = None
+    for path in ("qualified_nations.csv", "r32_nations.csv"):
+        if os.path.exists(path):
+            qdf = _read_csv(path)
+            col = "nation" if "nation" in qdf.columns else qdf.columns[0]
+            # convert full names → nation codes via the pool
+            full_to_code = {p.display_nation: p.nation_code
+                            for p in pool if hasattr(p, "display_nation")}
+            # fallback: match on nation_code directly if already codes
+            qual_raw = set(qdf[col].astype(str).str.strip())
+            # check if they look like codes (≤3 chars) or full names
+            if all(len(x) <= 3 for x in qual_raw if x):
+                qualified_nations = qual_raw
+            else:
+                # map full names to codes via pool
+                code_map = {}
+                for p in pool:
+                    code_map[p.nation_code] = p.nation_code   # identity
+                # use match_team from bridge for full-name → code
+                from fantasy_name_bridge import nation_lookup, match_team
+                team_lut_q = nation_lookup(pool)
+                qualified_nations = set()
+                for name in qual_raw:
+                    code = match_team(name, team_lut_q)
+                    if code:
+                        qualified_nations.add(code)
+                    else:
+                        qualified_nations.add(name)  # keep as-is, bridge miss
+            print(f"Transfer filter: candidates restricted to {len(qualified_nations)} "
+                  f"qualified nations (from {path}).")
+            break
+
     # affordable, nation cap ok). Score = xpts(in) - xpts(out).
     pool_by_pos: dict[str, list] = {}
     for p in pool:
@@ -102,6 +217,9 @@ def recommend(free_transfers=2, budget=100.0, nation_cap=3):
     for out_p in squad:
         for in_p in pool_by_pos[out_p.position]:
             if in_p.row in squad_rows:
+                continue
+            # reject candidates from eliminated nations
+            if qualified_nations and in_p.nation_code not in qualified_nations:
                 continue
             if xp.get(in_p.row, 0.0) <= xp.get(out_p.row, 0.0):
                 continue

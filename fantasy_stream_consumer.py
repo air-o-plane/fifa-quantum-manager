@@ -10,7 +10,7 @@ including the ~553 who have no row in the spreadsheet's RND<N>_Points tab.
 WHY THIS EXISTS
 ---------------
 The xPts model's ground truth is the hand-curated RND<N>_Points tab (best when
-available). But that only covers manually-transcribed scorers. This consumer
+available). But that only covers scorers Oliver transcribed. This consumer
 derives points straight from the streamed box scores, so:
   - players with no tab entry get a real, data-driven points estimate
     (not just the price prior), and

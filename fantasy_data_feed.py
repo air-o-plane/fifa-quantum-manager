@@ -41,7 +41,7 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
-PLAYER_POOL = "FIFA_Men_s_World_Cup_2026_Player_Pool.xlsx"
+PLAYER_POOL = "/mnt/user-data/uploads/FIFA_Men_s_World_Cup_2026_Player_Pool.xlsx"
 
 TOPIC_STATS        = "wc26.player.stats"
 TOPIC_AVAILABILITY = "wc26.player.availability"

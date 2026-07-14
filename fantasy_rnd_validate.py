@@ -22,7 +22,7 @@ def validate(round_no: int):
         df = _read_csv(csv_path)
     except FileNotFoundError:
         print(f"Missing {csv_path}. Run fantasy_rnd_points.py {round_no} first.")
-        return
+        return False
 
     issues, ok = [], 0
     seen: dict[int, str] = {}
@@ -60,9 +60,14 @@ def validate(round_no: int):
         print(f"\n{len(issues)} ISSUE(S) to fix:")
         for x in issues:
             print(f"  {x}")
-    else:
-        print("No issues — the points table is clean and ready for the xPts model.")
+        return False
+    print("No issues — the points table is clean and ready for the xPts model.")
+    return True
 
 
 if __name__ == "__main__":
-    validate(int(sys.argv[1]) if len(sys.argv) > 1 else 1)
+    ok = validate(int(sys.argv[1]) if len(sys.argv) > 1 else 1)
+    # Exit non-zero on issues so wrapper scripts (matchday_refresh.sh) halt
+    # the chain rather than feeding contaminated data into xpts.csv. This is
+    # the workflow gap that almost cost us during the Senesi-insert incident.
+    sys.exit(0 if ok else 1)

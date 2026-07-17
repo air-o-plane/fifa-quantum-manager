@@ -199,35 +199,57 @@ def verify_encoding(short):
 # ----------------------------------------------------------------------
 # Classiq cloud QAOA  (gated — needs authenticate(); see experiment_sweep)
 # ----------------------------------------------------------------------
-def run_on_classiq(short, budget_m, num_layers):
+def run_on_classiq(short, budget_m, num_layers,
+                   max_retries: int = 3, base_wait: float = 15.0):
     """One QAOA run on Classiq cloud using the CombinatorialProblem API
-    (classiq 1.17.0). Assumes classiq.authenticate() was already called this
+    (classiq 1.21.0). Assumes classiq.authenticate() was already called this
     session. Returns (combi, samples_df) where samples_df is the DataFrame
-    from combi.sample() with columns: solution, probability, cost."""
+    from combi.sample() with columns: solution, probability, cost.
+
+    Retries up to max_retries times on network timeouts (httpx.ReadTimeout,
+    httpcore.ReadTimeout) which consistently affect the 28-qubit budget
+    instance on long-running jobs. Waits base_wait * 2^attempt seconds
+    between retries (15s, 30s, 60s by default)."""
+    import time
+    try:
+        import httpx
+        import httpcore
+        TIMEOUT_EXCEPTIONS = (httpx.ReadTimeout, httpcore.ReadTimeout)
+    except ImportError:
+        TIMEOUT_EXCEPTIONS = (Exception,)   # fallback if httpx not importable
+
     from classiq.applications.combinatorial_optimization import CombinatorialProblem
 
     m = pyomo_model(short, budget_m)
-    combi = CombinatorialProblem(pyo_model=m, num_layers=num_layers,
-                                 penalty_factor=int(PENALTY))
-    combi.get_model()                       # synthesize the QAOA ansatz (cloud)
 
-    # optimize() runs the variational loop and returns the optimised parameters.
-    # Per the current docs the signature is: combi.optimize(maxiter, quantile)
-    # with no exec_prefs argument; backend defaults to simulator.
-    # maxiter progression (all at penalty=10, calibrated to obj fn scale):
-    #   60  → budget depth-1: all negative (insufficient iterations)
-    #   150 → budget depth-1: +0.381 (first positive result); depth-2: ERR
-    #          (Classiq platform overload); depth-3: -1.014
-    #   300 → current attempt: hoping to push depth-1 higher and get
-    #          consistent positive results across depths
-    # If 300 still insufficient, next step is 500 or exploring Grover mixer QAOA.
-    optimized_params = combi.optimize(maxiter=300, quantile=0.7)
+    for attempt in range(max_retries + 1):
+        try:
+            combi = CombinatorialProblem(pyo_model=m, num_layers=num_layers,
+                                         penalty_factor=int(PENALTY))
+            combi.get_model()               # synthesize the QAOA ansatz (cloud)
 
-    # sample() evaluates the circuit at the optimised parameters and returns a
-    # DataFrame with columns: solution (dict), probability (float), cost (float).
-    # cost is always a minimisation value, so maximisation problems use -cost.
-    samples_df = combi.sample(optimized_params)
-    return combi, samples_df
+            # optimize() runs the variational loop and returns the optimised
+            # parameters. maxiter progression (all at penalty=10):
+            #   60  → budget depth-1 all negative (insufficient iterations)
+            #   150 → budget depth-1 +0.381 (first positive); depth-2 ERR
+            #   300 → current: depth-1 +0.393; depth-2/3 ERR (network timeout)
+            optimized_params = combi.optimize(maxiter=300, quantile=0.7)
+
+            # sample() returns a DataFrame: solution, probability, cost.
+            # cost is minimisation convention → best value = -cost.min()
+            samples_df = combi.sample(optimized_params)
+            return combi, samples_df
+
+        except TIMEOUT_EXCEPTIONS as e:
+            if attempt < max_retries:
+                wait = base_wait * (2 ** attempt)
+                print(f"    [timeout on attempt {attempt+1}/{max_retries+1} "
+                      f"— retrying in {wait:.0f}s: {type(e).__name__}]")
+                time.sleep(wait)
+            else:
+                print(f"    [all {max_retries+1} attempts timed out — "
+                      f"recording ERR for this run]")
+                raise
 
 
 def best_value_from_result(short, combi, samples_df):
